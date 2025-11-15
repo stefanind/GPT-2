@@ -4,10 +4,26 @@ import os
 import torch
 
 def load_tokens(filename):
-    npt = np.load(filename)
-    npt = npt.astype(np.int32) # convert to int32 because pytorch prefers it
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
+    ext = os.path.splitext(filename)[1]
+
+    if ext == ".npy":
+        # edu_fineweb10B shards
+        npt = np.load(filename)
+        npt = npt.astype(np.int32) 
+
+    elif ext == ".bin":
+        # tinyshakespeare raw uint16 token file
+        n_bytes = os.path.getsize(filename)
+        n_tokens = n_bytes // 2   # uint16 = 2 bytes
+
+        # memory map for efficiency and large file support
+        npt = np.memmap(filename, dtype=np.uint16, mode="r", shape=(n_tokens,))
+        npt = npt.astype(np.int32)
+
+    else:
+        raise ValueError(f"Unknown token file format: {filename}")
+
+    return torch.tensor(npt, dtype=torch.long)
 
 # between shard shuffle
 # goal: smooth out training loss curve 
@@ -20,7 +36,17 @@ def between_shard_shuffle(shards, seed):
     return [shards[i] for i in perm]
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split, master_process, shuffle_shards=True, seed=1337):
+    def __init__(self, 
+                 B, 
+                 T, 
+                 process_rank, 
+                 num_processes, 
+                 split, 
+                 master_process, 
+                 dataset='fineweb10B',
+                 shuffle_shards=True, 
+                 seed=1337):
+        
         self.B = B
         self.T = T
 
@@ -30,24 +56,49 @@ class DataLoaderLite:
 
         assert split in {'train', 'val'}
 
-        # get the shard filenames
-        data_root = "edu_fineweb10B"
-        shards = os.listdir(data_root) # inputs all the files into a list
-        shards = [s for s in shards if split in s] # selects only those shards that are assoc w/ the split (val or train)
-        shards = sorted(shards) # sort the shards because listdir does not sort them
-        shards = [os.path.join(data_root, s) for s in shards] # joins the data_root path with the filename
-        assert len(shards) > 0, f"no shards found for split {split}"
-
-        # between shard shuffle
-        # NOTE: does not work with multiple epochs
-        # but since we are only training on one epoch, it is okay for now
-        if shuffle_shards and split == 'train':
-            shards = between_shard_shuffle(shards, seed)
-        self.shards = shards
+        self.dataset = dataset
+        # build shards depending on dataset
+        self.shards = self.build_shards(split, shuffle_shards, seed, master_process)
 
         if master_process:
-            print(f"found {len(shards)} shards for split {split}")
+            print(f"found {len(self.shards)} shards for split {split}")
         self.reset()
+
+
+    def build_shards(self, split, shuffle_shards, seed, master_process):
+        """Build self.shards depending on which dataset we're using."""
+        shards = []
+
+        if self.dataset == "fineweb10B":
+            data_root = "edu_fineweb10B"
+            shards = os.listdir(data_root)
+            shards = [s for s in shards if split in s]
+            shards = sorted(shards)
+            shards = [os.path.join(data_root, s) for s in shards]
+
+            assert len(shards) > 0, f"no shards found for split {split} in {data_root}"
+
+            # between-shard shuffle only for train
+            # NOTE: does not work with multiple epochs
+            # but since we are only training on one epoch, it is okay for now
+            if shuffle_shards and split == "train":
+                shards = between_shard_shuffle(shards, seed)
+
+        elif self.dataset == "tinyshakespeare":
+            # single file per split: data/train.bin, data/val.bin
+            data_root = os.path.join(os.path.dirname(__file__), "data")
+            fname = "train.bin" if split == "train" else "val.bin"
+            path = os.path.join(data_root, fname)
+            assert os.path.exists(path), f"file not found: {path}"
+            shards = [path]  # just one shard
+
+            if master_process:
+                print(f"using {path} for split {split}")
+
+        else:
+            raise ValueError(f"unknown dataset: {self.dataset}")
+
+        return shards
 
     def reset(self):
         # state, init at shard zero

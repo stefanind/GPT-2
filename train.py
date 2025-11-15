@@ -16,6 +16,8 @@ from dataloader import DataLoaderLite
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
+import torch.profiler as profiler
+
 # -------------------------------------------------------------------------------------------
 # train.py
 def main():
@@ -32,15 +34,28 @@ def main():
     enc = tiktoken.get_encoding("gpt2")
 
     # --- hyperparams ---
-    total_batch_size = 524288       # ~0.5M batch size in the number of tokens; used a "nice number" (2**19)
-    B, T             = 64, 1024     # batch size, sequence length
-    max_steps        = 19073        # 10**9 / 2**19 = 19073 -> 10B tokens / 524288 batch size = 19073 steps
-    warmup_steps     = 715          # GPT-3 paper says 375M tokens are for warmup; 375e6 / 2**19 = 715
+    dataset = 'tinyshakespeare' # or 'fineweb10B'
+    if dataset == 'fineweb10B':
+        total_batch_size = 524288       # ~0.5M batch size in the number of tokens; used a "nice number" (2**19)
+        B, T             = 64, 1024     # batch size, sequence length
+        max_steps        = 19073        # 10**9 / 2**19 = 19073 -> 10B tokens / 524288 batch size = 19073 steps
+        warmup_steps     = 715          # GPT-3 paper says 375M tokens are for warmup; 375e6 / 2**19 = 715
+        eval_every       = 500          # init evaluation every 500 steps of the main loop
+        save_every       = 5000         # init model checkpoint every 5000 steps of the main loop
+
+    # use tinyshakespeare for profiling the model
+    elif dataset == 'tinyshakespeare':
+        train_tokens     = 301966 * 10  # 10 epochs
+        total_batch_size = 15360        
+        B, T             = 12, 128      
+        max_steps        = 196          # 3019660 // 15360
+        warmup_steps     = 8            
+        eval_every       = 500          # won't be used for tinyshakespeare; eval will only happen at last step
+        save_every       = 5000         # won't be used for tinyshakespeare; save will only happen at last step
+
     max_lr           = 6e-4         # peak lr
     min_lr           = max_lr * 0.1 # final lr (10% of max)
     weight_decay     = 0.1          # weight decay the parameters for regularization
-    eval_every       = 500          # init evaluation every 500 steps of the main loop
-    save_every       = 5000         # init model checkpoint every 5000 steps of the main loop
     use_compile      = False        # torch.compile set to False because of issues while using it in eval mode
 
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure that the batch size is divisible by B * T * ddp_world_size"
@@ -57,9 +72,21 @@ def main():
         print(f"the full batch size: {total_batch_size}")
         print(f"gradient accumulation steps: {grad_accum_steps}")
 
-    # set the data/val loader
-    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, master_process=master_process, split='train')
-    val_loader   = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, master_process=master_process, split='val')
+    # set the data/val loader based on the desired dataset
+    train_loader = DataLoaderLite(B=B, 
+                                  T=T, 
+                                  process_rank=ddp_rank, 
+                                  num_processes=ddp_world_size, 
+                                  master_process=master_process, 
+                                  split='train', 
+                                  dataset=dataset)
+    val_loader   = DataLoaderLite(B=B, 
+                                  T=T, 
+                                  process_rank=ddp_rank, 
+                                  num_processes=ddp_world_size, 
+                                  master_process=master_process, 
+                                  split='val', 
+                                  dataset=dataset)
 
     # using TF32 (10-bit mantissa instead of 23-bit) for speed, as long as I have some reasonable accuracy
     # useful for training/inference
@@ -90,13 +117,39 @@ def main():
 
     # --- logging ---
     # create the a directory that we will write checkpoints to and log to
-    log_dir = "log"
+
+    log_dir = f"log_{dataset}"
     os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"log.txt")
+    log_file = os.path.join(log_dir, f"log_{dataset}.txt")
     # open the file to clear it out before appending to it later
     # goal: start from scratch each time a training run is done
     with open(log_file, "w") as f:
         pass
+
+    # --- profiler setup ---
+    use_profiler = master_process  # only profile on rank 0
+    if use_profiler:
+        prof_schedule = profiler.schedule(
+            wait=1,    # steps with no profiling (let things "warm up")
+            warmup=1,  # steps that are recorded but marked as warmup
+            active=3,  # steps actually saved to trace
+            repeat=1
+        )
+        prof_dir = os.path.join(log_dir, "profiler")
+        os.makedirs(prof_dir, exist_ok=True)
+
+        prof = profiler.profile(
+            activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.CUDA],
+            schedule=prof_schedule,
+            on_trace_ready=profiler.tensorboard_trace_handler(prof_dir),
+            record_shapes=True,  # records input tensor shapes for each operation
+            profile_memory=True, # track memory usage per operator
+            with_stack=True,     # 
+        )
+        prof.__enter__()
+    else:
+        prof = None
+
 
     # --- main train/eval loop ---
     for step in range(max_steps):
@@ -136,8 +189,9 @@ def main():
                     torch.save(checkpoint, checkpoint_path)
 
         # NOTE: torch.compile doesn't work with HellaSwag
+        # dataset has to be fineweb10B
         # --- HellaSwag eval (normalized) ---
-        if (step % eval_every == 0 or last_step) and (not use_compile):
+        if (step % eval_every == 0 or last_step) and (not use_compile) and (dataset == 'fineweb10B'):
             num_correct_norm = 0
             num_total = 0
             model.eval()
@@ -284,6 +338,14 @@ def main():
             print(f"step {step:4d}, | loss: {loss_accum.item():.6f}, | lr: {lr:.4e} | norm: {norm:.4f} | dt {dt:.2f}s | tok/sec: {tokens_per_sec:.2f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} train {loss_accum.item():.6f}\n")
+
+        # let profiler know one training iteration has finished
+        if prof is not None:
+            prof.step()
+
+    # --- cleanly close the profiler ---
+    if prof is not None:
+        prof.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

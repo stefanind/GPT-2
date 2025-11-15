@@ -17,7 +17,7 @@ class GPTConfig:
     n_layer: int     = 12    # number of layers
     n_head: int      = 12    # number of attn heads 
     n_embd: int      = 768   # embedding dimension
-    dropout: float   = 0.1   # percentage of neurons dropped out
+    dropout: float   = 0.0   # percentage of neurons dropped out
     bias: bool       = True  # add bias or not
 
 # ------------------------------------------------------------
