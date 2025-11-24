@@ -34,7 +34,18 @@ def main():
     enc = tiktoken.get_encoding("gpt2")
 
     # --- hyperparams ---
-    dataset = 'tinyshakespeare' # or 'fineweb10B'
+    
+    # set the dataset wanted: 'tinyshakespeare' or 'fineweb10B'
+    # 'tinyshakespeare' as a simple toy example 
+    # 'fineweb10B' for main training run
+    dataset = 'tinyshakespeare' 
+
+    # CHECK GPU TYPE BEFORE RUNNING
+    # if Ampere or above, use bfloat16 with torch.autocast -> set use_autocast = True
+    # if not, don't use torch.autocast -> set use_autocast = False
+    use_autocast = True
+
+
     if dataset == 'fineweb10B':
         total_batch_size = 524288       # ~0.5M batch size in the number of tokens; used a "nice number" (2**19)
         B, T             = 64, 1024     # batch size, sequence length
@@ -166,7 +177,10 @@ def main():
                 for _ in range(val_loss_steps):
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    if use_autocast:
+                        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                            logits, loss = model(x, y)
+                    else:
                         logits, loss = model(x, y)
                     loss = loss / val_loss_steps
                     val_loss_accum += loss.detach()
@@ -204,7 +218,10 @@ def main():
                 tokens, mask = tokens.to(device), mask.to(device)
                 # get the logits
                 with torch.no_grad():
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    if use_autocast:
+                        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                            logits, loss = model(tokens)
+                    else:
                         logits, loss = model(tokens)
                     pred_norm = get_most_likely_row(tokens, mask, logits)
                 num_total += 1
@@ -238,7 +255,10 @@ def main():
             while xgen.size(1) < max_length:
                 # forward the model to get the logits
                 with torch.no_grad():
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    if use_autocast:   
+                        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                            logits, loss = model(xgen) # (B, T, vocab_size)
+                    else:
                         logits, loss = model(xgen) # (B, T, vocab_size)
                     # take the logits at the last position
                     logits = logits[:, -1, :] # (B, vocab_size)
@@ -284,10 +304,12 @@ def main():
             if ddp:
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
 
-            # ------ CHECK GPU TYPES BEFORE RUNNING!!! ------
-            with torch.autocast(dtype=torch.bfloat16, device_type=device_type): # only allowed with Ampere and newer GPUs
+            
+            if use_autocast:
+                with torch.autocast(dtype=torch.bfloat16, device_type=device_type): 
+                    logits, loss = model(x, y)
+            else:
                 logits, loss = model(x, y)
-
             # scale each loss by the total steps to match a normal training loop
             # if no scaling, then the gradients are SUMing instead of MEANing
             # i.e., cross entropy uses 'reduction=mean' not 'reduction=sum'
