@@ -2,7 +2,7 @@
 
 #include <torch/extension.h>   // pytorch C++ API
 
-// declare the CUDA kernel (defined in gelu.cu)
+// declare the CUDA kernel (defined in bias_gelu_kernel.cu)
 void bias_gelu_forward_cuda(
     const float* x,
     const float* bias,
