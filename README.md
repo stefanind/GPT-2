@@ -1,6 +1,4 @@
-This is a complete adaptation of GPT-2 (with some GPT-3 hyperparameters) followed from Andrej Karpathy's YouTube lectures, "Neural Networks: Zero to Hero". Specifically, this is a follow along from the video "Let's reproduce GPT-2." 
-
-The code is mostly his (I take no rights to it), but I rewrote it by following along, added my own comments for educational purposes, and refactored it. Therefore, I understand every piece of code written and the role it plays. 
+This is a complete adaptation of GPT-2 (with some GPT-3 hyperparameters) followed from Andrej Karpathy's YouTube lectures, "Neural Networks: Zero to Hero". 
 
 Distributed training is set up such that one GPU or multiple can be used. (FSDP will be added on later).
 
