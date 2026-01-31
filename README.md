@@ -1,6 +1,4 @@
-This is a complete adaptation of GPT-2 (with some GPT-3 hyperparameters) followed from Andrej Karpathy's YouTube lectures, "Neural Networks: Zero to Hero". Specifically, this is a follow along from the video "Let's reproduce GPT-2." 
-
-The code is mostly his (I take no rights to it), but I rewrote it by following along, added my own comments for educational purposes, and refactored it. Therefore, I understand every piece of code written and the role it plays. 
+This is a complete adaptation of GPT-2 (with some GPT-3 hyperparameters) followed from Andrej Karpathy's YouTube lectures, "Neural Networks: Zero to Hero". 
 
 Distributed training is set up such that one GPU or multiple can be used. (FSDP will be added on later).
 
@@ -31,25 +29,3 @@ Profiled the model to compare underutilizing GPU resources versus maximally util
 ![torch.compile A100](images/compiled_gpu.png)
 
 Training time (Time Duration) can clearly be seen that it decreases as more GPU resources are used. Specifically, using more optimized kernels where there are fused operations reduce the CPU overhead by having less memory movement from global memory to local memory. What is essentially happening is that fused operations (when torch.compile is activated) allow the CPU to launch a single kernel that performs multiple operations (combining multiple kernels into one) entirely on the GPU, rather than launching separate kernels that write intermediate results back to global memory before the next operation. Basically, reduce ping ponging back and forth from global memory because it is slow. 
-
-
-### Fused bias + GELU 
-
-Normally in a transformer MLP block, there is a 3 step process where there is a linear matmul, an added bias, and then a GELU activation. Each step usually calls three different kernels for each step, leading to 2-3 extra global memory read/writes. The custom kernel reduces the memory overhead by only requiring 2 kernel launches and saves 1 global write/read.  
-
-Before kernel:
-- y = x @ W
-- z = y + b
-- out = gelu(z)
-
-After kernel:
-- y = x @ W
-- out = gelu(y + b)
-
-
-
-Addons in the process:
-- FSDP training for educational purposes (the model isn't big enough to require multiple GPUs to be split)
-- KV cache
-- GQA/MQA
-
