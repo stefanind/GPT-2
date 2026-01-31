@@ -1,4 +1,5 @@
 import os
+import math
 import inspect
 from dataclasses import dataclass
 
@@ -23,8 +24,6 @@ class GPTConfig:
 # ------------------------------------------------------------
 # Model
 
-# TODO: implement RoPE
-
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -35,10 +34,10 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
 
         # project to 3 for query, key, values
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=True)
 
         # seems pointless but important to be used to mix info from concatenated heads
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=True)
 
         # tag for scaling down the variance of the residual stream
         self.c_proj.SCALE_INIT = 1
@@ -51,10 +50,10 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
 
         # -------- only needed if flash attention isn't used or is_causal=False
-        # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-        #                     .view(1, 1, config.block_size, config.block_size))
-        
-    def forward(self, x):
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                            .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x, past_kv=None): # if not None, then we have T=1
         # get all dimensions
         B, T, C = x.size()
 
@@ -71,14 +70,36 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # ------- manual attention
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+
+        # --- KV cache ---
+        # append new k,v to cached past_k, past_v
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=-2)
+            v = torch.cat([past_v, v], dim=-2)
+
+        present_kv = (k, v)
+
+        # needed when manual att is used, not scaled_dot_product_attention
+        # T_total = k.size(-2)
+
+        # --- manual attention ---
+        # scale the dot product w/ embd size 
+        # goal: higher magnitudes from dot products need to be scaled down because dn want softmax
+        # to be saturated with them since it leads to tiny gradients -> thus unstable training
+        # the embd size of k is chosen because magnitude scales with vector dim
+        # softmax is sensitive to large magnitudes so this is needed
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) 
+        # att = att.masked_fill(self.bias[:,:,T_total-T:T_total,:T_total] == 0, float('-inf'))
         # att = F.softmax(att, dim=-1)
         # y = att @ v      # B, T, nh, hs
         
         # ------- flash attention (need CUDA)
-        # is_causal=True so the mask isn't needed
+        # if no CUDA, then regular PyTorch attention w/o efficient kernels
+        # is_causal=True to not require the manual mask
+        # NOTE: during decode, if T=1 then is_causal can be False w/o issue
+        # but keeping it as True won't break it as well
+        # hence, keeping it as true
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         
         # concat all head outputs
@@ -86,7 +107,7 @@ class CausalSelfAttention(nn.Module):
 
         # mixes info from all head outputs and adds dropout
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, present_kv
 
 # GPT-2 MLP but with added dropout regularization
 class MLP(nn.Module):
@@ -128,12 +149,13 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp  = MLP(config)
     
-    def forward(self, x):
+    def forward(self, x, past_kv=None):
+        attn_out, present_kv = self.attn(self.ln_1(x), past_kv=past_kv)
         # residual stream + attn
-        x = x + self.attn(self.ln_1(x))
+        x = x + attn_out
         # residual stream + mlp
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, present_kv
     
 class GPT(nn.Module):
 
@@ -150,7 +172,7 @@ class GPT(nn.Module):
             wpe  = nn.Embedding(config.block_size, config.n_embd),
 
             # ModuleList = list but with inherited nn.Module
-            # creates n_layer amount of attn Blocks to split embeddings
+            # creates n_layer amount of attn Blocks
             h    = nn.ModuleList(Block(config) for _ in range(config.n_layer)),
             # after the attn block mlp + residual stream, final layernorm
             ln_f = nn.LayerNorm(config.n_embd)
@@ -195,16 +217,29 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, past_kv=None):
 
         # idx of shape (B, T) -> batch size by sequence length 
         B, T = idx.size()
 
-        # ensure that the sequence length is not bigger than context 
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}"
+        # --- KV cache
+        if past_kv is None:
+            # init the whole kv cache layers as None of size n_layer
+            past_kv = [None] * self.config.n_layer
+            past_len = 0
+        else:
+            # the cache length is stored in k
+            # past_kv[0] is layer0, [0] is k, size(-2) is seq length
+            past_len = past_kv[0][0].size(-2)
 
+
+        # KV Cache: add past_len now 
+        # ensure that the sequence length is not bigger than context 
+        assert past_len + T <= self.config.block_size, f"Cannot forward sequence of length {past_len + T}"
+
+        # KV cache: positions now have to be offset by past_len during decode
         # position of each token up to the sequence length, T
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos = torch.arange(past_len, past_len + T, dtype=torch.long, device=idx.device)
 
         # input the positions to get their embeddings
         pos_emb = self.transformer.wpe(pos)
@@ -215,9 +250,12 @@ class GPT(nn.Module):
         # combine the token embeddings and the positional embeddings
         x = tok_emb + pos_emb
 
+        # KV cache: now require to pass each layer's respected past_kv[i]
+        present_kv = []
         # pass through the 12 blocks, each w/ their layernorms, attn, and mlp
-        for block in self.transformer.h:
-            x = block(x)
+        for i, block in enumerate(self.transformer.h):
+            x, pkv = block(x, past_kv=past_kv[i])
+            present_kv.append(pkv)
 
         # pass through the layernorm after the attn mlp's
         x = self.transformer.ln_f(x)
@@ -231,7 +269,7 @@ class GPT(nn.Module):
             # takes (B*T, V), the logits, and (B*T), the targets, as input to calculate the loss
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-        return logits, loss
+        return logits, loss, present_kv
     
     # regularize weights
     # goal: pull down weights so the network finds a solution that doesn't involve large weights
@@ -279,6 +317,7 @@ class GPT(nn.Module):
     
     # use the pretrained GPT-2 for evaluation comparison
     # goal: want to compare my model against GPT-2
+    # NOTE: not compatible with RMSNorm
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
