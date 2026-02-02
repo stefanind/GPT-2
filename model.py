@@ -17,6 +17,7 @@ class GPTConfig:
     vocab_size: int  = 50257 # number of tokens: 256 bytes tokens, 1 EoT token, and 50,000 BPE merges
     n_layer: int     = 12    # number of layers
     n_head: int      = 12    # number of attn heads 
+    n_kv_head: int   = 12    # set to 1 for MQA; <n_head for GQA
     n_embd: int      = 768   # embedding dimension
     dropout: float   = 0.0   # percentage of neurons dropped out
     bias: bool       = True  # add bias or not
@@ -32,22 +33,30 @@ class CausalSelfAttention(nn.Module):
         # check if the number of embeddings is a multiple of the number of heads
         # ensures that the embeddings can be properly split to each attn head
         assert config.n_embd % config.n_head == 0
+        assert config.n_head % config.n_kv_head == 0, "n_head must be divisible by n_kv_head"
+
+        # initialize number of heads and embeddings
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        # for GQA/MQA
+        self.n_kv_head = config.n_kv_head
+        self.head_dim  = config.n_embd // config.n_head
+
+        # Q has n_heads, KV have n_kv_heads
+        self.c_q   = nn.Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_kv  = nn.Linear(config.n_embd, 2 * self.n_kv_head * self.head_dim, bias=False)
 
         # project to 3 for query, key, values
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=True)
+        # self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=True)
 
         # seems pointless but important to be used to mix info from concatenated heads
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=True)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
         # tag for scaling down the variance of the residual stream
         self.c_proj.SCALE_INIT = 1
 
         # added dropout for regularization
         self.resid_dropout = nn.Dropout(config.dropout)
-
-        # initialize number of heads and embeddings
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
 
         # -------- only needed if flash attention isn't used or is_causal=False
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
@@ -57,19 +66,20 @@ class CausalSelfAttention(nn.Module):
         # get all dimensions
         B, T, C = x.size()
 
+        # using GQA/MQA
         # get query, key, values
-        qkv = self.c_attn(x)
+        q  = self.c_q(x)    # (B, T, n_head*hd)
+        kv = self.c_kv(x)   # (B, T, 2*n_kv_head*hd)
+        k, v = kv.split(self.n_kv_head * self.head_dim, dim=2)
 
+        # w/o GQA/MQA
+        # qkv = self.c_attn(x)
         # get three B, T, C, split along dim=2 (C)
-        q, k, v = qkv.split(self.n_embd, dim=2) # split into size of self.n_embd along the 2nd dim
+        # q, k, v = qkv.split(self.n_embd, dim=2) # split into size of self.n_embd along the 2nd dim
 
-        # make the number of heads into a batch dimension like B
-        # want pytorch to treat them as batches
-        # all turn into -> (batch size, number of heads, sequence length, embd size for each head)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)     # (B, n_head, T, hd)
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)  # (B, n_kv_head, T, hd)
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)  # (B, n_kv_head, T, hd)
 
         # --- KV cache ---
         # append new k,v to cached past_k, past_v
@@ -78,28 +88,18 @@ class CausalSelfAttention(nn.Module):
             k = torch.cat([past_k, k], dim=-2)
             v = torch.cat([past_v, v], dim=-2)
 
-        present_kv = (k, v)
+        kv = (k, v)
 
-        # needed when manual att is used, not scaled_dot_product_attention
-        # T_total = k.size(-2)
 
-        # --- manual attention ---
-        # scale the dot product w/ embd size 
-        # goal: higher magnitudes from dot products need to be scaled down because dn want softmax
-        # to be saturated with them since it leads to tiny gradients -> thus unstable training
-        # the embd size of k is chosen because magnitude scales with vector dim
-        # softmax is sensitive to large magnitudes so this is needed
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) 
-        # att = att.masked_fill(self.bias[:,:,T_total-T:T_total,:T_total] == 0, float('-inf'))
-        # att = F.softmax(att, dim=-1)
-        # y = att @ v      # B, T, nh, hs
+        # make KV heads match Q heads for attention
+        if self.n_kv_head != self.n_head:
+            repeat = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(repeat, dim=1)  # (B, n_head, T_total, hd)
+            v = v.repeat_interleave(repeat, dim=1)  # (B, n_head, T_total, hd)
+
         
         # ------- flash attention (need CUDA)
         # if no CUDA, then regular PyTorch attention w/o efficient kernels
-        # is_causal=True to not require the manual mask
-        # NOTE: during decode, if T=1 then is_causal can be False w/o issue
-        # but keeping it as True won't break it as well
-        # hence, keeping it as true
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         
         # concat all head outputs
@@ -107,7 +107,7 @@ class CausalSelfAttention(nn.Module):
 
         # mixes info from all head outputs and adds dropout
         y = self.resid_dropout(self.c_proj(y))
-        return y, present_kv
+        return y, kv
 
 # GPT-2 MLP but with added dropout regularization
 class MLP(nn.Module):
@@ -150,12 +150,12 @@ class Block(nn.Module):
         self.mlp  = MLP(config)
     
     def forward(self, x, past_kv=None):
-        attn_out, present_kv = self.attn(self.ln_1(x), past_kv=past_kv)
+        attn_out, kv = self.attn(self.ln_1(x), past_kv=past_kv)
         # residual stream + attn
         x = x + attn_out
         # residual stream + mlp
         x = x + self.mlp(self.ln_2(x))
-        return x, present_kv
+        return x, kv
     
 class GPT(nn.Module):
 
@@ -251,11 +251,12 @@ class GPT(nn.Module):
         x = tok_emb + pos_emb
 
         # KV cache: now require to pass each layer's respected past_kv[i]
-        present_kv = []
+
+        kv = []
         # pass through the 12 blocks, each w/ their layernorms, attn, and mlp
-        for i, block in enumerate(self.transformer.h):
+        for i,block in enumerate(self.transformer.h):
             x, pkv = block(x, past_kv=past_kv[i])
-            present_kv.append(pkv)
+            kv.append(pkv)
 
         # pass through the layernorm after the attn mlp's
         x = self.transformer.ln_f(x)
@@ -269,7 +270,7 @@ class GPT(nn.Module):
             # takes (B*T, V), the logits, and (B*T), the targets, as input to calculate the loss
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-        return logits, loss, present_kv
+        return logits, loss, kv
     
     # regularize weights
     # goal: pull down weights so the network finds a solution that doesn't involve large weights
