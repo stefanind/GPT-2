@@ -20,16 +20,104 @@ class GPTConfig:
     n_kv_head: int   = 12    # set to 1 for MQA; <n_head for GQA
     n_embd: int      = 768   # embedding dimension
     dropout: float   = 0.0   # percentage of neurons dropped out
-    bias: bool       = True  # add bias or not
+    bias: bool       = False  
+
+    # --- MoE ---
+    use_moe: bool    = True
+    n_experts: int   = 8      # number of expert MLPs
+    top_k: int       = 2      # top-k routing
 
 # ------------------------------------------------------------
 # Model
+
+class MoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_experts = config.n_experts
+        self.top_k = config.top_k
+
+        # router: d_model -> n_experts
+        self.router = nn.Linear(config.n_embd, self.n_experts, bias=config.bias)
+
+        # expert MLPs
+        self.experts = nn.ModuleList([MLP(config) for _ in range(self.n_experts)])
+
+    def forward(self, x):
+        B, T, C = x.shape
+        N = B * T
+        x_flat = x.view(N, C)
+
+        logits = self.router(x_flat)                # (N, E)
+        probs  = torch.softmax(logits, dim=-1)      # (N, E)
+
+        topw, topi = torch.topk(probs, self.top_k, dim=-1)  # (N, K)
+        topw = topw / (topw.sum(dim=-1, keepdim=True) + 1e-9)
+
+        top1 = topi[:, 0]  # (N,)
+        load = torch.bincount(top1, minlength=self.n_experts).float() / top1.numel()  # (E,)
+        importance = probs.mean(dim=0)  # (E,)
+
+        # assess the overall importance and load of expert use
+        # if importance not uniform, push it towards uniform
+        # if load not uniform, push it towards uniform
+        l_aux = self.n_experts * torch.sum(load * importance)
+
+        # assess the overall size of the logits
+        # penalize large vals
+        z_loss = (logits.logsumexp(dim=-1) ** 2).mean()
+
+        # tk_id | exp_id | weight | embd
+        # tk_id[0] -> [exp_id[0], weight[0], embd[0]]
+        # if tk_id[0] has more than one expert
+        # tk_id[0] -> [exp_id[1], weight[1], embd[1]]
+        token_ids  = torch.arange(N, device=x.device).repeat_interleave(self.top_k)  # (N*K,)
+        expert_ids = topi.reshape(-1)                                                # (N*K,)
+        weights    = topw.reshape(-1)                                                # (N*K,)
+        x_rep      = x_flat.repeat_interleave(self.top_k, dim=0)                     # (N*K, C)
+
+        # rearrange from tk_id order to exp_id order
+        # tk_id[0] -> [exp_id[0], weight[0], embd[0]]
+        # to exp_id[0] -> [tk_id[0], weight[0], embd[0]]
+        order = torch.argsort(expert_ids)
+        token_ids  = token_ids[order]
+        expert_ids = expert_ids[order]
+        weights    = weights[order]
+        x_rep      = x_rep[order]
+
+
+        # how many counts for each expert
+        counts = torch.bincount(expert_ids, minlength=self.n_experts) # (E,) on GPU
+
+        # only sync once to reduce CPU comms
+        # resolves not using .item() in a loop to gather each experts tokens
+        counts_list = counts.tolist()
+
+        # split each into their respected experts
+        x_chunks   = torch.split(x_rep,     counts_list, dim=0)
+        w_chunks   = torch.split(weights,   counts_list, dim=0)
+        tok_chunks = torch.split(token_ids, counts_list, dim=0)
+
+        # accum each tk final output
+        y_flat = torch.zeros_like(x_flat)  # (N, C)
+
+        for e in range(self.n_experts):
+            if counts_list[e] == 0:
+                continue
+
+            y_e = self.experts[e](x_chunks[e])               # (cnt, C)
+            y_e = y_e * w_chunks[e].unsqueeze(-1)            # (cnt, 1)
+            y_flat.index_add_(0, tok_chunks[e], y_e)
+        
+        y = y_flat.view(B, T, C)
+
+        return y, l_aux, z_loss
+
 
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-
+        self.config = config
         # check if the number of embeddings is a multiple of the number of heads
         # ensures that the embeddings can be properly split to each attn head
         assert config.n_embd % config.n_head == 0
@@ -59,8 +147,8 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
 
         # -------- only needed if flash attention isn't used or is_causal=False
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                            .view(1, 1, config.block_size, config.block_size))
+        # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+        #                     .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x, past_kv=None): # if not None, then we have T=1
         # get all dimensions
@@ -90,7 +178,6 @@ class CausalSelfAttention(nn.Module):
 
         kv = (k, v)
 
-
         # make KV heads match Q heads for attention
         if self.n_kv_head != self.n_head:
             repeat = self.n_head // self.n_kv_head
@@ -100,7 +187,7 @@ class CausalSelfAttention(nn.Module):
         
         # ------- flash attention (need CUDA)
         # if no CUDA, then regular PyTorch attention w/o efficient kernels
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.config.dropout)
         
         # concat all head outputs
         y = y.transpose(1, 2).contiguous().view(B, T, C) # 'contiguous' since transpose alone dn lay it into memory but view() needs it to be
@@ -147,15 +234,29 @@ class Block(nn.Module):
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp  = MLP(config)
+        self.mlp = MoE(config) if getattr(config, "use_moe", False) else MLP(config)
+
     
     def forward(self, x, past_kv=None):
         attn_out, kv = self.attn(self.ln_1(x), past_kv=past_kv)
         # residual stream + attn
         x = x + attn_out
+
+        h = self.ln_2(x)
+        
+        # when there is no aux/z losses
+        l_aux = x.new_zeros(())
+        z_loss = x.new_zeros(())
+
+        if isinstance(self.mlp, MoE):
+            y, l_aux, z_loss = self.mlp(h)
+        else:
+            y = self.mlp(h)
+        
         # residual stream + mlp
-        x = x + self.mlp(self.ln_2(x))
-        return x, kv
+        x = x + y
+
+        return x, kv, l_aux, z_loss
     
 class GPT(nn.Module):
 
@@ -250,13 +351,18 @@ class GPT(nn.Module):
         # combine the token embeddings and the positional embeddings
         x = tok_emb + pos_emb
 
-        # KV cache: now require to pass each layer's respected past_kv[i]
+        # for if MoE isn't used
+        total_l_aux = x.new_zeros(())
+        total_z_loss = x.new_zeros(())
 
+        # KV cache: now require to pass each layer's respected past_kv[i]
         kv = []
         # pass through the 12 blocks, each w/ their layernorms, attn, and mlp
         for i,block in enumerate(self.transformer.h):
-            x, pkv = block(x, past_kv=past_kv[i])
+            x, pkv, l_aux, z_loss = block(x, past_kv=past_kv[i])
             kv.append(pkv)
+            total_l_aux = total_l_aux + l_aux
+            total_z_loss = total_z_loss + z_loss
 
         # pass through the layernorm after the attn mlp's
         x = self.transformer.ln_f(x)
@@ -264,11 +370,16 @@ class GPT(nn.Module):
         # get the logits via linear layer, i.e., from embedding size transformed to vocab size
         logits = self.lm_head(x) # (B, T, 50257)
 
+
+        alpha = 0.01
+        beta  = 1e-3
+
         loss = None
         # for training
         if targets is not None:
             # takes (B*T, V), the logits, and (B*T), the targets, as input to calculate the loss
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = ce_loss + alpha * total_l_aux + beta * total_z_loss
 
         return logits, loss, kv
     
@@ -316,55 +427,4 @@ class GPT(nn.Module):
 
         return optimizer
     
-    # use the pretrained GPT-2 for evaluation comparison
-    # goal: want to compare my model against GPT-2
-    # NOTE: not compatible with RMSNorm
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """Loads pretrained GPT-2 model weights from huggingface"""
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
     
