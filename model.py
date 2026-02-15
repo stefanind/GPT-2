@@ -27,10 +27,6 @@ class GPTConfig:
     n_experts: int   = 8      # number of expert MLPs
     top_k: int       = 2      # top-k routing
 
-    # --- RMSNorm ---
-    norm_eps: float = 1e-5
-    use_rmsnorm: bool = True
-
 # ------------------------------------------------------------
 # Model
 
@@ -240,26 +236,24 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-# GPT-2 transformer blocks
-# different from the original transformer in GPT-2 because layernorm is added before attn as well
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.rms_1 = nn.RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.rms_2 = nn.RMSNorm(config.n_embd)
         self.mlp = MoE(config) if getattr(config, "use_moe", False) else MLP(config)
 
     
     def forward(self, x, past_kv=None):
-        attn_out, kv = self.attn(self.ln_1(x), past_kv=past_kv)
+        attn_out, kv = self.attn(self.rms_1(x), past_kv=past_kv)
         # residual stream + attn
         x = x + attn_out
 
-        h = self.ln_2(x)
+        h = self.rms_2(x)
         
-        # when there is no aux/z losses
+        # when there are no aux/z losses
         l_aux = x.new_zeros(())
         z_loss = x.new_zeros(())
 
@@ -290,8 +284,8 @@ class GPT(nn.Module):
             # ModuleList = list but with inherited nn.Module
             # creates n_layer amount of attn Blocks
             h    = nn.ModuleList(Block(config) for _ in range(config.n_layer)),
-            # after the attn block mlp + residual stream, final layernorm
-            ln_f = nn.LayerNorm(config.n_embd)
+            # after the attn block mlp + residual stream
+            rms = nn.RMSNorm(config.n_embd)
         ))
 
         # projects the embeddings up to the vocab size for classification
@@ -310,6 +304,9 @@ class GPT(nn.Module):
         # but for nn.Linear, linear weight initialization are set to a uniform distribution
         # https://docs.pytorch.org/docs/stable/generated/torch.nn.Linear.html
         # so initializate weights according to GPT-2 -> normal dist w/ 0.02 std 
+
+        # NOTE: using RMSNorm instead of Layernorm has the same initialization.
+        # so don't have to init it differently since the scale is 1
 
         # NOTE: 0.02 std is roughly around the Xavier initialization so no need for 1/sqrt(d_model)
         if isinstance(module, nn.Linear):
@@ -372,15 +369,13 @@ class GPT(nn.Module):
 
         # KV cache: now require to pass each layer's respected past_kv[i]
         kv = []
-        # pass through the 12 blocks, each w/ their layernorms, attn, and mlp
         for i,block in enumerate(self.transformer.h):
             x, pkv, l_aux, z_loss = block(x, past_kv=past_kv[i])
             kv.append(pkv)
             total_l_aux = total_l_aux + l_aux
             total_z_loss = total_z_loss + z_loss
 
-        # pass through the layernorm after the attn mlp's
-        x = self.transformer.ln_f(x)
+        x = self.transformer.rms(x)
 
         # get the logits via linear layer, i.e., from embedding size transformed to vocab size
         logits = self.lm_head(x) # (B, T, 50257)
@@ -409,9 +404,10 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad} # filters out 'frozen' params 
 
         # split the params into those that will be weight decayed and those that will not be
-        # goal: want to weight decay matrices; don't want to weight decay biases or 1D tensors (doesn't make sense to decay single biases or the scale/shift in layernorm)
+        # goal: want to weight decay matrices; don't want to weight decay biases or 1D tensors 
+        # (doesn't make sense to decay single biases or the scale/shift in RMSNorm)
         decay_params = [p for n,p in param_dict.items() if p.dim() >= 2]  # matrices containing params
-        nodecay_params = [p for n,p in param_dict.items() if p.dim() < 2] # 1D tensors: layernorm, biases
+        nodecay_params = [p for n,p in param_dict.items() if p.dim() < 2] # 1D tensors: RMSNorm, biases
 
         # pass into AdamW to tune only the 'decay_params' with weight decay
         optim_groups = [
