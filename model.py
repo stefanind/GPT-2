@@ -27,6 +27,10 @@ class GPTConfig:
     n_experts: int   = 8      # number of expert MLPs
     top_k: int       = 2      # top-k routing
 
+    # --- RMSNorm ---
+    norm_eps: float = 1e-5
+    use_rmsnorm: bool = True
+
 # ------------------------------------------------------------
 # Model
 
@@ -196,32 +200,43 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y, kv
 
-# GPT-2 MLP but with added dropout regularization
+
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        # 4x projection, exactly as the original transformer
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
 
-        # uses approximate GELU; not needed anymore but used for proper replication
-        # GELU over RELU to remove dead neurons
-        self.gelu    = nn.GELU(approximate='tanh')
+        # adjust for parameter count when using SwiGLU
+        # GELU MLP 4x expansion has 8d**2 parameters
+        # SwiGLU has 3dh parameters
+        # therefore, 3dh = 8d**2 -> h = 8/3d
+        hidden_dim = (8 * config.n_embd) // 3
+        # systems trick for faster kernels
+        # multiples of 64 used since smaller model
+        hidden_dim = (hidden_dim + 63) // 64 * 64
+
+        self.fc    = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.bias)
 
         # back from the 4x projection down to size of n_embd
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.proj  = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
 
         # tag for scaling down the variance of the residual stream
-        self.c_proj.SCALE_INIT = 1
+        self.proj.SCALE_INIT = 1
 
         # regularization
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        # pass through the input x
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
+        # (B, T, C) -> (B, T, 2H)
+        x = self.fc(x)
+
+        # went to 2 * hidden_dim to chunk
+        x_gate, x_val = x.chunk(2, dim=-1)
+
+        # SwiGLU = SiLU(gate) * value
+        x = F.silu(x_gate) * x_val
+
+        x = self.proj(x)
         x = self.dropout(x)
         return x
 
